@@ -8,8 +8,15 @@ using namespace uzu::activation_type;
 template <typename T>
 inline T activate_silu_alpha(T x, float alpha) {
   float xf = float(x);
-  float y = 1.0f / (1.0f + fast::exp(-fabs(xf) * alpha));
-  float out = (xf < 0.0f) ? (1.0f - y) * xf : y * xf;
+  float scaled = alpha * xf;
+  // exp(scaled) can underflow before multiplication by x produces a normal
+  // result. Reconstruct the magnitude directly in the far negative tail.
+  if (scaled < -80.0f) {
+    return T(metal::copysign(fast::exp(fast::log(fabs(xf)) + scaled), xf));
+  }
+  float e = fast::exp(-fabs(scaled));
+  float y = (scaled < 0.0f ? e : 1.0f) / (1.0f + e);
+  float out = y * xf;
   return static_cast<T>(out);
 }
 

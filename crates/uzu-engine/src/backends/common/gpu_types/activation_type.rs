@@ -37,7 +37,12 @@ pub fn activation_silu_alpha<T: Float>(
     alpha: f32,
 ) -> T {
     let x_float = x.to_f32().unwrap();
-    let y_float = x_float / (1.0f32 + (-alpha * x_float).exp());
+    let scaled = alpha * x_float;
+    // The final result can be normal even when exp(-scaled) overflows.
+    if scaled < -80.0 {
+        return T::from((x_float.abs().ln() + scaled).exp().copysign(x_float)).unwrap();
+    }
+    let y_float = x_float / (1.0f32 + (-scaled).exp());
     T::from(y_float).unwrap()
 }
 

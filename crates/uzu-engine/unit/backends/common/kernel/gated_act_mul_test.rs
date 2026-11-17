@@ -53,13 +53,21 @@ fn run_interleaved<T: DataTypeRepr + Float, B: Backend>(
     input: &InterleavedInput<T>,
     use_hadamard: bool,
 ) -> Vec<T> {
+    run_interleaved_with_settings::<T, B>(input, use_hadamard, GatedActMulSettings::default())
+}
+
+fn run_interleaved_with_settings<T: DataTypeRepr + Float, B: Backend>(
+    input: &InterleavedInput<T>,
+    use_hadamard: bool,
+    settings: GatedActMulSettings,
+) -> Vec<T> {
     let context = block_on(B::Context::new()).expect("create context");
     let kernel = GatedActMul::<B>::full_precision(
         &context,
         T::data_type(),
         true,
         use_hadamard.then_some(HADAMARD_TRANSFORM_BLOCK_SIZE),
-        GatedActMulSettings::default(),
+        settings,
     )
     .expect("create GatedActMul");
 
@@ -396,4 +404,79 @@ fn test_gated_act_mul_clipping_bounds_wire_format() {
     let empty_pair = serde_json::from_str::<ClippingBounds>("[null,null]").expect("deserialize empty bounds");
     assert_eq!(empty_pair.into_pair(), None);
     assert_eq!(serde_json::to_string(&empty_pair).expect("serialize empty bounds"), "null");
+}
+
+fn test_gated_silu_reference<T: DataTypeRepr + Float>() {
+    let gated_dim = 131;
+    let batch_dim = 3;
+    let gates = [
+        -1e38, -1e20, -180.0, -100.0, -90.0, -88.0, -40.0, -30.0, -20.0, -17.0, -16.0, -8.0, -0.0, 0.0, 0.1, 4.0, 20.0,
+        40.0, 1e20, 1e38,
+    ];
+    let values = [-1.0, -0.75, 0.5, 0.125, 0.75, 1.0];
+    let mut fused_up = vec![T::one(); batch_dim * 2 * gated_dim];
+    for row in 0..batch_dim {
+        for col in 0..gated_dim {
+            fused_up[row * 2 * gated_dim + col] = T::from(values[(row + col) % values.len()]).unwrap();
+            fused_up[row * 2 * gated_dim + gated_dim + col] = T::from(gates[col % gates.len()]).unwrap();
+        }
+    }
+    let input = InterleavedInput {
+        fused_up: fused_up.into_boxed_slice(),
+        hadamard_factors: vec![1; gated_dim].into_boxed_slice(),
+        gated_dim: gated_dim as u32,
+        batch_dim: batch_dim as u32,
+        act_type: ActivationType::SILU,
+    };
+    let rtol = if T::data_type() == DataType::BF16 {
+        0.008
+    } else {
+        2e-5
+    };
+    for alpha in [None, Some(-1.7), Some(0.0), Some(0.5), Some(1.7), Some(1e-18), Some(1e-36), Some(1e36)] {
+        for_each_backend!(|B| {
+            let actual = run_interleaved_with_settings::<T, B>(
+                &input,
+                false,
+                GatedActMulSettings {
+                    activation_alpha: alpha,
+                    ..Default::default()
+                },
+            );
+            for (i, value) in actual.iter().enumerate() {
+                let row = i / gated_dim;
+                let col = i % gated_dim;
+                let x = input.fused_up[row * 2 * gated_dim + gated_dim + col].to_f64().unwrap();
+                let factor = input.fused_up[row * 2 * gated_dim + col].to_f64().unwrap();
+                // The public kernel rounds activation to T before the T multiply.
+                let activated =
+                    T::from(x / (1.0 + (-f64::from(alpha.unwrap_or(1.0)) * x).exp())).unwrap().to_f64().unwrap();
+                let expected = T::from(factor * activated).unwrap().to_f64().unwrap();
+                let value = value.to_f64().unwrap();
+                // Metal fast math may flush a subnormal final result. This
+                // does not excuse losing a normal result to an intermediate.
+                let tolerance = if expected != 0.0 && expected.abs() < f64::from(f32::MIN_POSITIVE) {
+                    f64::from(f32::MIN_POSITIVE)
+                } else {
+                    rtol * expected.abs()
+                };
+                assert!(
+                    (value - expected).abs() <= tolerance,
+                    "Gated SiLU {:?} {} alpha={alpha:?} x={x}: expected={expected:e}, actual={value:e}",
+                    T::data_type(),
+                    std::any::type_name::<B>()
+                );
+            }
+        });
+    }
+}
+
+#[uzu_test]
+fn test_gated_silu_reference_f32() {
+    test_gated_silu_reference::<f32>();
+}
+
+#[uzu_test]
+fn test_gated_silu_reference_bf16() {
+    test_gated_silu_reference::<bf16>();
 }

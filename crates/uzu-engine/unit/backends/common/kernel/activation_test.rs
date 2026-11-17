@@ -16,7 +16,7 @@ use crate::{
     data_type::{DataType, DataTypeRepr},
     tests::{
         assert::assert_eq_float,
-        helpers::{buffer_to_vec, create_buffer, create_buffer_with_data, for_each_non_cpu_backend},
+        helpers::{buffer_to_vec, create_buffer, create_buffer_with_data, for_each_backend, for_each_non_cpu_backend},
     },
 };
 
@@ -326,4 +326,147 @@ fn test_silu_custom_alpha_bf16() {
 #[uzu_test]
 fn test_silu_custom_alpha_in_place_f32() {
     test_activation::<f32>(ActivationType::SILU, 1.7, true);
+}
+
+fn test_silu_reference<T: DataTypeRepr + Float>() {
+    // Include the negative tail, which is not covered by make_data(). Compute
+    // the reference independently in f64, after rounding the input to T.
+    let data = (-5120..=5120).map(|i| T::from(f64::from(i) / 64.0).unwrap()).collect::<Vec<_>>();
+    let (rtol, atol) = match T::data_type() {
+        DataType::F16 => (0.002, 2f64.powi(-24)),
+        DataType::BF16 => (0.008, 0.0),
+        _ => (2e-5, 0.0),
+    };
+    for in_place in [false, true] {
+        let input = Input {
+            data: data.clone().into_boxed_slice(),
+            act_type: ActivationType::SILU,
+            alpha: 1.0,
+            in_place,
+        };
+        for_each_backend!(|B| {
+            let actual = get_output::<T, B>(&input);
+            for (index, (&x, &actual)) in input.data.iter().zip(actual.iter()).enumerate() {
+                let x = x.to_f64().unwrap();
+                let expected = T::from(x / (1.0 + (-x).exp())).unwrap().to_f64().unwrap();
+                let actual = actual.to_f64().unwrap();
+                assert!(
+                    (actual - expected).abs() <= atol + rtol * expected.abs(),
+                    "SiLU {:?} {} in_place={in_place} index={index} x={x}: expected={expected:e}, actual={actual:e}",
+                    T::data_type(),
+                    std::any::type_name::<B>()
+                );
+            }
+        });
+    }
+}
+
+#[uzu_test]
+fn test_silu_reference_f32() {
+    test_silu_reference::<f32>();
+}
+
+#[uzu_test]
+fn test_silu_reference_f16() {
+    test_silu_reference::<f16>();
+}
+
+#[uzu_test]
+fn test_silu_reference_bf16() {
+    test_silu_reference::<bf16>();
+}
+
+// The final result is normal even though exp(x) alone is subnormal.
+fn check_silu_extreme_tail<T: DataTypeRepr + Float>() {
+    let input = Input {
+        data: [-91.0, -90.5, -90.0, -89.5, -89.0, -88.5, -88.0]
+            .into_iter()
+            .map(|x| T::from(x).unwrap())
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        act_type: ActivationType::SILU,
+        alpha: 1.0,
+        in_place: false,
+    };
+    let rtol = if T::data_type() == DataType::BF16 {
+        0.008
+    } else {
+        2e-5
+    };
+    let mut errors = Vec::new();
+    for_each_backend!(|B| {
+        let actual = get_output::<T, B>(&input);
+        for (&x, &value) in input.data.iter().zip(&actual) {
+            let x = x.to_f64().unwrap();
+            let expected = T::from(x / (1.0 + (-x).exp())).unwrap().to_f64().unwrap();
+            let actual = value.to_f64().unwrap();
+            assert!(expected.abs() >= f64::from(f32::MIN_POSITIVE));
+            if !actual.is_finite() || (actual - expected).abs() > rtol * expected.abs() {
+                errors.push(format!(
+                    "SiLU extreme {:?} {} x={x}: expected={expected:e}, actual={actual:e}",
+                    T::data_type(),
+                    std::any::type_name::<B>()
+                ));
+            }
+        }
+    });
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+#[uzu_test]
+fn test_silu_extreme_tail_f32() {
+    check_silu_extreme_tail::<f32>();
+}
+
+#[uzu_test]
+fn test_silu_extreme_tail_bf16() {
+    check_silu_extreme_tail::<bf16>();
+}
+
+fn check_silu_alpha_reference<T: DataTypeRepr + Float>() {
+    let (rtol, atol) = match T::data_type() {
+        DataType::F16 => (0.002, 2f64.powi(-24)),
+        DataType::BF16 => (0.008, 0.0),
+        _ => (2e-5, 0.0),
+    };
+    for alpha in [-1.7, 0.0, 0.5, 1.0, 1.7] {
+        for in_place in [false, true] {
+            let input = Input {
+                data: [-40.0, -30.0, -20.0, -17.0, -8.0, 0.0, 0.1, 4.0, 20.0, 40.0]
+                    .into_iter()
+                    .map(|x| T::from(x).unwrap())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                act_type: ActivationType::SILU,
+                alpha,
+                in_place,
+            };
+            for_each_backend!(|B| {
+                let actual = get_output::<T, B>(&input);
+                for (&x, &value) in input.data.iter().zip(&actual) {
+                    let x = x.to_f64().unwrap();
+                    let expected = T::from(x / (1.0 + (-f64::from(alpha) * x).exp())).unwrap().to_f64().unwrap();
+                    let actual = value.to_f64().unwrap();
+                    assert!(
+                        actual.is_finite() && (actual - expected).abs() <= atol + rtol * expected.abs(),
+                        "SiLU alpha {:?} {} alpha={alpha} in_place={in_place} x={x}: expected={expected:e} actual={actual:e}",
+                        T::data_type(),
+                        std::any::type_name::<B>()
+                    );
+                }
+            });
+        }
+    }
+}
+
+#[uzu_test]
+fn test_silu_alpha_reference_f32() {
+    check_silu_alpha_reference::<f32>();
+}
+#[uzu_test]
+fn test_silu_alpha_reference_f16() {
+    check_silu_alpha_reference::<f16>();
+}
+#[uzu_test]
+fn test_silu_alpha_reference_bf16() {
+    check_silu_alpha_reference::<bf16>();
 }
